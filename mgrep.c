@@ -29,9 +29,22 @@
 #include <unistd.h>
 
 #if 0
+/* GNU libiberty */
 #include "eregex.h"
 #include "regex.c"
+#define NEED_CONVERT
+#elif 0
+/*
+ * Henry Spencer's "Tcl library"
+ * https://github.com/garyhouston/hsrex
+ * https://garyhouston.github.io/regex/
+ */
+#include "regalone.h"
+#include "regex.h"
+#define regcomp(r, p, c) re_comp(r, (const void *)(p), j, c)
+#define regexec(r, s, n, m, e) re_exec(r, (const void *)(s), buf + sz - (char *)(s), NULL, n, m, e)
 #else
+/* system */
 #include <regex.h>
 #ifndef __APPLE__
 #define NEED_CONVERT
@@ -65,17 +78,19 @@ static void
 report_substr(const char *buf, const char *ptr, size_t len)
 {
     if (len > INT_MAX) {
-        fprintf(stderr, "string too long @0x%zu\n", ptr - buf);
+        fprintf(stderr, "string too long @%zu\n", ptr - buf);
         len = INT_MAX;
     }
     printf("%.*s", (int)len, ptr);
 }
 
 static void
-report_match(const char *buf, const char *ptr, const regmatch_t *match, int print_match_only)
+report_match(const char *buf, const char *ptr, const regmatch_t *match, int first, int show_byte_offset, int print_match_only)
 {
+    static const char *oldptr = NULL;
+    static size_t oldlen = -1;
+
     size_t len = match[0].rm_eo - match[0].rm_so;
-    ptr += match[0].rm_so;
     if (!print_match_only) {
         for (; ptr > buf && ptr[-1] != '\n'; ptr--, len++) {
             continue;
@@ -85,20 +100,36 @@ report_match(const char *buf, const char *ptr, const regmatch_t *match, int prin
                 continue;
             }
         }
+        if (ptr == oldptr && len == oldlen) {
+            return;
+        }
+        oldptr = ptr;
+        oldlen = len;
+    }
+    if (!first) {
+        printf("--\n");
+    }
+    if (show_byte_offset) {
+        printf("%zu:", ptr - buf);
     }
     report_substr(buf, ptr, len);
+    printf("\n");
 }
 
 static int
-process_pattern(regex_t *reg, const char *pat, int icase, int debug_submatches)
+process_pattern(regex_t *reg, const char *pat, int regex_comp_flags, int debug_submatches)
 {
     int rv;
     char *buf;
     size_t len;
     unsigned i, j;
-    int cflags = REG_NEWLINE | REG_EXTENDED
+    int eolbol = 0;
+    int cflags = regex_comp_flags | REG_NEWLINE | REG_EXTENDED
 #ifdef REG_ENHANCED
         | REG_ENHANCED
+#endif
+#ifdef REG_ADVANCED
+        | REG_ADVANCED
 #endif
     ;
     if (!strncmp(pat, "(?s)", 4)) {
@@ -113,6 +144,13 @@ process_pattern(regex_t *reg, const char *pat, int icase, int debug_submatches)
     for (i = 0, j = 0; pat[i]; i++, j++) {
         if (pat[i] == '\\') {
             switch (pat[i + 1]) {
+                case '^':
+                case '$':
+                case '\\':
+                    buf[j++] = '\\';
+                    buf[j] = pat[i + 1];
+                    i++;
+                    continue;
                 case 'N':
                     if (cflags & REG_NEWLINE) {
                         buf[j] = '.';
@@ -129,9 +167,16 @@ process_pattern(regex_t *reg, const char *pat, int icase, int debug_submatches)
                     buf[j] = '\n';
                     i++;
                     continue;
+                case 's':
+                    buf[j++] = '[';
+                    buf[j++] = ' ';
+                    buf[j++] = '\t';
+                    buf[j] = ']';
+                    i++;
+                    continue;
                 case 'd':
                     buf[j++] = '[';
-                    buf[j++] = '1';
+                    buf[j++] = '0';
                     buf[j++] = '-';
                     buf[j++] = '9';
                     buf[j] = ']';
@@ -141,6 +186,10 @@ process_pattern(regex_t *reg, const char *pat, int icase, int debug_submatches)
                     int hi, lo;
                     if ((hi = tohex(pat[i + 2])) >= 0 && (lo = tohex(pat[i + 3])) >= 0) {
                         buf[j] = (hi << 4) | lo;
+                        if (buf[j] == '^' || buf[j] == '$') {
+                            buf[j + 1] = buf[j];
+                            buf[j++] = '\\';
+                        }
                     }
                     i += 3;
                     continue;
@@ -148,11 +197,14 @@ process_pattern(regex_t *reg, const char *pat, int icase, int debug_submatches)
 #endif
             }
         }
+        if (pat[i] == '^' || pat[i] == '$') {
+            eolbol = 1;
+        }
         buf[j] = pat[i];
     }
     buf[j] = '\0';
-    if (icase) {
-        cflags |= REG_ICASE;
+    if (eolbol && debug_submatches) {
+        fprintf(stderr, "Warning: unescaped ^ or $ not recommended. Use \\n to match newlines\n");
     }
     if (debug_submatches) {
         fprintf(stderr, "0x%x: '%s'\n", cflags, buf);
@@ -190,6 +242,11 @@ map_file(int fd, size_t sz, size_t psz, size_t *msz)
         perror("mmap");
         return NULL;
     }
+#ifdef KILL_TRAILING_NEWLINE
+    if (sz && buf[sz - 1] == '\n') {
+        sz--;
+    }
+#endif
     if (buf[sz]) {
         int rv = mprotect((char *)(((uintptr_t)buf + sz) & ~(psz - 1)), psz, PROT_READ | PROT_WRITE);
         if (rv) {
@@ -271,10 +328,13 @@ main(int argc, char **argv)
     int debug_submatches = 0;
     int have_match_limit = 0;
     long max_match_count = 0;
-
     const char *myself = argv[0];
     const char *pattern = NULL;
     const char *filename = NULL;
+    int eflags = 0;
+    int pmatch = 0;
+    int amatch = 0;
+    size_t off = 0;
 
     while (--argc > 0) {
         const char *p = *++argv;
@@ -351,6 +411,11 @@ main(int argc, char **argv)
         return rv;
     }
     sz = st.st_size;
+    if (!sz) {
+        close(fd);
+        regfree(&reg);
+        return 1;
+    }
     psz = getpagesize();
     buf = map_file(fd, sz, psz, &msz);
     close(fd);
@@ -359,32 +424,46 @@ main(int argc, char **argv)
         return -1;
     }
 
-    for (ptr = buf; (!have_match_limit || max_match_count-- > 0) && ptr < buf + sz; ptr++) {
-        int eflags = 0;
+    for (ptr = buf; (!have_match_limit || max_match_count > 0) && ptr < buf + sz; ) {
         regmatch_t match[32];
-        if (ptr != buf) {
-            eflags |= REG_NOTBOL;
-            madvise(buf, (ptr - buf) & ~(psz - 1), MADV_DONTNEED);
+        size_t whereami = (ptr - buf) & ~(psz - 1);
+        if (off < whereami) {
+            madvise(buf + off, whereami - off, MADV_DONTNEED);
+            off = whereami;
         }
         rv = regexec(&reg, ptr, sizeof(match) / sizeof(match[0]), match, eflags);
         if (rv) {
-            if (ptr == buf) {
+            if (!amatch && debug_submatches) {
                 report_error(rv, &reg);
             }
             break;
         }
-        if (ptr != buf) {
-            printf("--\n");
+        if (match[0].rm_so < 0 || match[0].rm_so > match[0].rm_eo || ptr + match[0].rm_eo > buf + sz) {
+            fprintf(stderr, "bad match @%zu: so = %lld, eo = %lld\n",
+                    ptr - buf,
+                    (long long)match[0].rm_so,
+                    (long long)match[0].rm_eo);
+            amatch = 0;
+            break;
         }
-        if (show_byte_offset) {
-            printf("%zu:", ptr + match[0].rm_so - buf);
+        ptr += match[0].rm_so;
+#ifndef KILL_TRAILING_NEWLINE
+        if (match[0].rm_eo == match[0].rm_so && ptr > buf && ptr[-1] == '\n' && ptr == buf + sz) {
+            break;
         }
-        report_match(buf, ptr, match, print_match_only);
-        printf("\n");
+#endif
+        eflags |= REG_NOTBOL;
+        if (pmatch && match[0].rm_eo == 0) {
+            pmatch = 0;
+            ptr++;
+            continue;
+        }
+        report_match(buf, ptr, match, !amatch, show_byte_offset, print_match_only);
+        ptr -= match[0].rm_so;
         if (debug_submatches) {
             unsigned i;
             for (i = 1; i <= reg.re_nsub; i++) {
-                if (match[i].rm_so < 0) {
+                if (match[i].rm_so < match[0].rm_so || match[i].rm_so > match[i].rm_eo || match[i].rm_eo > match[0].rm_eo) {
                     continue;
                 }
                 printf("-=%d=- (", i);
@@ -393,9 +472,12 @@ main(int argc, char **argv)
             }
         }
         ptr += match[0].rm_eo;
+        max_match_count--;
+        pmatch = 1;
+        amatch = 1;
     }
 
     munmap(buf, msz);
     regfree(&reg);
-    return (ptr == buf);
+    return !amatch;
 }
