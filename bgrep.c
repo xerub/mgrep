@@ -108,7 +108,7 @@ str2hex(size_t buflen, unsigned char *buf, unsigned char *mask, const char *str,
         default:
             width = 1;
     }
-    while (buflen >= width) {
+    while (buflen >= (size_t)width) {
         int nibble = *str++;
         if (nibble >= '0' && nibble <= '9') {
             nibble -= '0';
@@ -219,12 +219,11 @@ find_string(const unsigned char* haystack, size_t hlen,
             const unsigned char* needle,   size_t nlen,
             const unsigned char* mask, size_t seq_pos, size_t seq_len)
 {
-    size_t tail = nlen - (seq_pos + seq_len);
-    while (hlen >= tail) {
+    while (hlen >= nlen) {
         size_t i;
         const unsigned char *ptr = haystack;
         if (seq_len) {
-            ptr = boyermoore_horspool_memmem(haystack + seq_pos, hlen - tail, needle + seq_pos, seq_len);
+            ptr = boyermoore_horspool_memmem(haystack + seq_pos, hlen - nlen + seq_len, needle + seq_pos, seq_len);
             if (!ptr) {
                 break;
             }
@@ -236,8 +235,8 @@ find_string(const unsigned char* haystack, size_t hlen,
             }
         }
         if (i < seq_pos) {
-            haystack++;
-            hlen--;
+            hlen -= ptr - haystack + 1;
+            haystack = ptr + 1;
             continue;
         }
         for (i += seq_len; i < nlen; i++) {
@@ -246,8 +245,8 @@ find_string(const unsigned char* haystack, size_t hlen,
             }
         }
         if (i < nlen) {
-            haystack++;
-            hlen--;
+            hlen -= ptr - haystack + 1;
+            haystack = ptr + 1;
             continue;
         }
         return ptr;
@@ -285,6 +284,7 @@ bgrep(const char *filename, const unsigned char *pattern, size_t len, const unsi
 
     ptr = p - 1;
     while (max < 0 || *any < max) {
+        size_t i;
         size_t left = st.st_size - (++ptr - p);
         ptr = find_string(ptr, left, pattern, len, mask, seq_pos, seq_len);
         if (!ptr) {
@@ -293,7 +293,11 @@ bgrep(const char *filename, const unsigned char *pattern, size_t len, const unsi
         if (show_fnames) {
             printf("%s: ", filename);
         }
-        printf("0x%zx\n", ptr - p);
+        printf("0x%zx:", ptr - p);
+        for (i = 0; i < len; i++) {
+            printf(" %02x", ptr[i]);
+        }
+        printf("\n");
         (*any)++;
     }
 
